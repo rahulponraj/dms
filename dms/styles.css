@@ -1,3 +1,4 @@
+[hidden]{display:none!important}
 :root{--bg:#f2f4f6;--ink:#10243a;--mut:#6b7a8a;--line:#dde3e9;--card:#fff;--teal:#0f8b8d;--amber:#e8a200;--red:#d64545;--green:#2e9e5b;--blue:#3b6fd4;--r:10px}
 *{box-sizing:border-box}body{margin:0;font:15px/1.5 'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--ink)}
 h1,h2,h3,.brand{font-family:'Bricolage Grotesque',sans-serif;margin:0}
