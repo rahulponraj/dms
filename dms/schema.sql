@@ -1,9 +1,9 @@
 -- Run in Supabase > SQL Editor
 create table transporters(id uuid primary key default gen_random_uuid(), name text not null, contact text, phone text, email text, created_at timestamptz default now());
-create table dealers(id uuid primary key default gen_random_uuid(), code text unique not null, name text not null, city text, state text, transit_days int not null default 3, default_transporter_id uuid references transporters(id));
+create table dealers(id uuid primary key default gen_random_uuid(), code text unique not null, name text unique not null, city text, state text, transit_days int not null default 3, default_transporter_id uuid references transporters(id));
 create table profiles(id uuid primary key references auth.users(id) on delete cascade, role text not null check(role in('admin','transporter')), name text, transporter_id uuid references transporters(id));
 create table invoices(
-  id uuid primary key default gen_random_uuid(), invoice_no text unique not null, invoice_date date not null, amount numeric, dealer_id uuid references dealers(id),
+  id uuid primary key default gen_random_uuid(), invoice_no text unique not null, invoice_date date not null, amount numeric, units numeric, dispatch_date date, delivery_date date, dealer_id uuid references dealers(id),
   expected_date date, transporter_id uuid references transporters(id), suggested_transporter_id uuid references transporters(id),
   status text not null default 'imported' check(status in('imported','assigned','accepted','dispatched','in_transit','delivered','closed')),
   discrepancy text, lr_no text, lr_url text, delay_reason text, revised_date date, pod_url text, pod_status text default 'none' check(pod_status in('none','pending','approved','rejected')), pod_note text,

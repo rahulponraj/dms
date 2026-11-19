@@ -57,13 +57,13 @@ function table(list) {
 function bindRows() { document.querySelectorAll('tr.row').forEach(r=>r.onclick=()=>openInvoice(r.dataset.id)); }
 function inv() {
   const admin = me.role==='admin'; $('#title').textContent = admin ? 'Invoices' : 'My deliveries';
-  if (admin) $('#actions').innerHTML = `<label class="btn primary">Import invoices CSV<input type="file" accept=".csv" hidden id="impInv"></label>`;
+  if (admin) $('#actions').innerHTML = `<label class="btn primary">Upload invoice PDF<input type="file" accept=".pdf" hidden id="impPdf"></label><label class="btn">Import CSV<input type="file" accept=".csv" hidden id="impInv"></label>`;
   $('#view').innerHTML = `<div class="panel"><div class="tools"><input id="q" placeholder="Search invoice or dealer" value="${esc(filter.q)}"><select id="fs"><option value="">All statuses</option>${STEPS.map(s=>`<option value="${s[0]}">${s[1]}</option>`).join('')}<option value="overdue">Overdue</option></select></div><div id="tbl"></div></div>`;
   $('#fs').value = filter.s;
   const draw = () => { filter.q=$('#q').value; filter.s=$('#fs').value; const q=filter.q.toLowerCase();
     $('#tbl').innerHTML = table(invoices.filter(i=>(!q||i.invoice_no.toLowerCase().includes(q)||dName(i.dealer_id).toLowerCase().includes(q))&&(!filter.s||(filter.s==='overdue'?overdue(i):i.status===filter.s)))); bindRows(); };
   $('#q').oninput = draw; $('#fs').onchange = draw; draw();
-  if (admin) $('#impInv').onchange = importInvoices;
+  if (admin) { $('#impInv').onchange = importInvoices; $('#impPdf').onchange = importPdf; }
 }
 function pod() {
   $('#title').textContent = 'POD review';
@@ -111,13 +111,36 @@ function podDecide(id, ok) { const n=$('#pN').value; if(!ok&&!n) return toast('A
 /* ---------- Masters + CSV import ---------- */
 function parseCSV(t) { const rows=[]; let r=[],c='',q=false; for(let k=0;k<t.length;k++){const ch=t[k]; if(q){ if(ch==='"'&&t[k+1]==='"'){c+='"';k++;} else if(ch==='"') q=false; else c+=ch; } else if(ch==='"') q=true; else if(ch===','){r.push(c);c='';} else if(ch==='\n'||ch==='\r'){ if(ch==='\r'&&t[k+1]==='\n')k++; r.push(c);c=''; if(r.some(x=>x.trim()))rows.push(r); r=[]; } else c+=ch; } if(c||r.length){r.push(c);rows.push(r);} const h=rows.shift().map(x=>x.trim().toLowerCase()); return rows.map(r=>Object.fromEntries(h.map((k,n)=>[k,(r[n]||'').trim()]))); }
 const readCSV = async e => { const f=e.target.files[0]; e.target.value=''; return f ? parseCSV(await f.text()) : null; };
-async function importInvoices(e) {
-  const rows = await readCSV(e); if(!rows) return; const bad=[];
-  const out = rows.map(r => { const d=dealers.find(x=>x.code===r.dealer_code); if(!d||!r.invoice_no||!r.invoice_date){bad.push(r.invoice_no||'(blank)');return null;}
-    const exp=new Date(r.invoice_date+'T00:00'); exp.setDate(exp.getDate()+d.transit_days);
-    return {invoice_no:r.invoice_no,invoice_date:r.invoice_date,amount:+r.amount||0,dealer_id:d.id,expected_date:exp.toISOString().slice(0,10),suggested_transporter_id:d.default_transporter_id}; }).filter(Boolean);
-  if (out.length) { const {error}=await sb.from('invoices').upsert(out,{onConflict:'invoice_no',ignoreDuplicates:true}); if(error) return toast(error.message); }
-  toast(`Imported ${out.length} invoices${bad.length?` · skipped ${bad.length} (unknown dealer code or missing fields)`:''}`); refresh();
+const nd = x => x ? x : null;
+function toInvoice(r) {
+  const key = s => (s||'').toUpperCase().replace(/\s+/g,'');
+  const d = dealers.find(x => (r.dealer_code && x.code===r.dealer_code) || (r.dealer_name && key(x.name)===key(r.dealer_name)));
+  if (!d || !r.invoice_no || !r.invoice_date) return null;
+  const exp = new Date(r.invoice_date+'T00:00'); exp.setDate(exp.getDate()+(d.transit_days||3));
+  const tr = transporters.find(t => key(t.name)===key(r.transporter));
+  const st = r.status==='delivered' ? 'closed' : r.status==='in_transit' ? 'in_transit' : (tr ? 'assigned' : 'imported');
+  return {invoice_no:r.invoice_no, invoice_date:r.invoice_date, amount:+r.amount||null, units:+r.units||null, dealer_id:d.id,
+    expected_date:nd(r.expected_date)||exp.toISOString().slice(0,10), suggested_transporter_id:d.default_transporter_id,
+    transporter_id:tr?.id||null, lr_no:nd(r.lr_no), dispatch_date:nd(r.dispatch_date), delivery_date:nd(r.delivery_date), status:st};
+}
+async function saveInvoices(rows) {
+  const out = rows.map(toInvoice).filter(Boolean), skipped = rows.length-out.length;
+  for (let n=0; n<out.length; n+=200) { const {error}=await sb.from('invoices').upsert(out.slice(n,n+200),{onConflict:'invoice_no',ignoreDuplicates:true}); if (error) return toast(error.message); }
+  toast(`Imported ${out.length} invoices${skipped?` · skipped ${skipped} (dealer not found or fields missing)`:''}`); refresh();
+}
+async function importInvoices(e) { const rows = await readCSV(e); if (rows) saveInvoices(rows); }
+async function importPdf(e) {
+  const f = e.target.files[0]; e.target.value=''; if (!f) return;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const doc = await pdfjsLib.getDocument({data: await f.arrayBuffer()}).promise; let txt = '';
+  for (let p=1; p<=doc.numPages; p++) txt += (await (await doc.getPage(p)).getTextContent()).items.map(i=>i.str).join(' ') + ' ';
+  txt = txt.replace(/\s+/g,' ');
+  const no = (txt.match(/Invoice No\.?:?\s*([A-Z0-9\/-]+)/i)||[])[1], dt = (txt.match(/Invoice Date:?\s*(\d{1,2} \w{3} \d{4})/i)||[])[1];
+  const amt = (txt.match(/Grand Total:?\s*([\d,.]+)/i)||[])[1], units = (txt.match(/Total\s+[\d.]+\s+([\d.]+)\s+[\d.]+/)||[])[1];
+  const key = s => s.toUpperCase().replace(/\s+/g,''), T = key(txt);
+  const d = [...dealers].sort((a,b)=>b.name.length-a.name.length).find(x => T.includes(key(x.name)));
+  if (!no || !dt || !d) return toast('Could not read this PDF. Check that the invoice number, date and dealer name are in the dealer list.');
+  await saveInvoices([{invoice_no:no, invoice_date:new Date(dt+' 12:00').toISOString().slice(0,10), dealer_name:d.name, units, amount:(amt||'').replace(/,/g,'')}]);
 }
 function mas() {
   $('#title').textContent = 'Masters';
