@@ -31,3 +31,9 @@ create policy "docs_rw" on storage.objects for all to authenticated using(bucket
 -- AFTER creating users in Authentication > Users, link them:
 -- insert into profiles(id,role,name) values('<admin-user-uuid>','admin','HQ Admin');
 -- insert into profiles(id,role,name,transporter_id) values('<user-uuid>','transporter','Name','<transporter-uuid>');
+
+-- Permissions for the Data API (needed on newer Supabase projects; safe to re-run)
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+grant usage, select on all sequences in schema public to authenticated;
+grant execute on all functions in schema public to authenticated;

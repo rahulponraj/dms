@@ -1,4 +1,4 @@
-const sb = supabase.createClient(DMS_CONFIG.SUPABASE_URL, DMS_CONFIG.SUPABASE_ANON_KEY);
+let sb = supabase.createClient(DMS_CONFIG.SUPABASE_URL, DMS_CONFIG.SUPABASE_ANON_KEY);
 const $ = s => document.querySelector(s), today = () => new Date().toISOString().slice(0,10);
 const STEPS = [['imported','Imported'],['assigned','Assigned'],['accepted','Accepted'],['dispatched','Dispatched'],['in_transit','In transit'],['delivered','Delivered'],['closed','Closed']];
 let me, invoices = [], dealers = [], transporters = [], tab, filter = {q:'',s:''};
@@ -14,14 +14,16 @@ $('#loginBtn').onclick = async () => {
   const { error } = await sb.auth.signInWithPassword({ email: $('#email').value, password: $('#pass').value });
   if (error) $('#loginErr').textContent = 'Check your email and password, then try again.'; else boot();
 };
+$('#demoHQ').onclick = () => { sb = mockClient('admin'); boot(); };
+$('#demoTR').onclick = () => { sb = mockClient('transporter'); boot(); };
 $('#logout').onclick = async () => { await sb.auth.signOut(); location.reload(); };
 
 async function boot() {
   const { data: { user } } = await sb.auth.getUser(); if (!user) return;
-  const { data: p } = await sb.from('profiles').select('*').eq('id', user.id).single();
-  if (!p) { $('#loginErr').textContent = 'Your account has no role yet. Ask HQ to set it up.'; return; }
+  const { data: p, error: pe } = await sb.from('profiles').select('*').eq('id', user.id).maybeSingle();
+  if (!p) { $('#loginErr').textContent = pe ? 'Could not load your profile: ' + pe.message : 'Your account has no role yet. Ask HQ to set it up.'; return; }
   me = p; $('#login').hidden = true; $('#app').hidden = false;
-  $('#who').textContent = `${p.name || user.email} · ${p.role === 'admin' ? 'HQ' : 'Transporter'}`;
+  $('#who').textContent = `${p.name || user.email} · ${p.role === 'admin' ? 'HQ' : 'Transporter'}${sb.isDemo ? ' · DEMO' : ''}`;
   const nav = p.role === 'admin' ? [['dash','Dashboard'],['inv','Invoices'],['pod','POD review'],['mas','Masters']] : [['inv','My deliveries']];
   $('#nav').innerHTML = nav.map(n=>`<button data-t="${n[0]}">${n[1]}</button>`).join('');
   $('#nav').onclick = e => e.target.dataset.t && go(e.target.dataset.t);
@@ -77,7 +79,7 @@ async function openInvoice(id) {
   const idx = STEPS.findIndex(s=>s[0]===i.status), late = overdue(i);
   const link = async (path,label) => { if(!path) return '—'; const {data}=await sb.storage.from('docs').createSignedUrl(path,3600); return `<a class="link" target="_blank" href="${data?.signedUrl}">${label}</a>`; };
   let act = '';
-  if (admin && ['imported','assigned'].includes(i.status)) act += `<div class="form"><h4>Assign transporter</h4>${i.suggested_transporter_id?`<span class="muted">Suggested: ${esc(tName(i.suggested_transporter_id))}</span>`:''}<select id="aT">${transporters.map(t=>`<option value="${t.id}" ${t.id===(i.transporter_id||i.suggested_transporter_id)?'selected':''}>${esc(t.name)}</option>`).join('')}</select><button class="btn primary" onclick="assign('${id}')">Confirm assignment</button></div>`;
+  if (admin && ['imported','assigned'].includes(i.status)) act += `<div class="form"><h4>Assign transporter</h4>${i.suggested_transporter_id?`<span class="muted">Dealer\'s usual transporter: ${esc(tName(i.suggested_transporter_id))}</span>`:''}<select id="aT"><option value="">Select transporter</option>${transporters.map(t=>`<option value="${t.id}" ${t.id===i.transporter_id?'selected':''}>${esc(t.name)}</option>`).join('')}</select><button class="btn primary" onclick="assign('${id}')">Confirm assignment</button></div>`;
   if (admin && i.pod_status==='pending') act += `<div class="form"><h4>Review proof of delivery</h4><input id="pN" placeholder="Note (required if rejecting)"><div style="display:flex;gap:8px"><button class="btn primary" onclick="podDecide('${id}',true)">Approve and close</button><button class="btn danger" onclick="podDecide('${id}',false)">Reject</button></div></div>`;
   if (!admin) {
     if (i.status==='assigned') act += `<div class="form"><h4>Review invoice</h4><textarea id="disc" placeholder="Report a discrepancy in goods received (optional)"></textarea><button class="btn primary" onclick="step('${id}',{status:'accepted',discrepancy:$('#disc').value||null},'Accepted invoice')">Accept invoice</button></div>`;
@@ -101,7 +103,7 @@ async function step(id, patch, action, note) {
   await sb.from('activity_log').insert({invoice_id:id, actor:me.name||me.role, action, note:note||null});
   toast('Saved'); closeDrawer(); refresh();
 }
-const assign = id => step(id,{transporter_id:$('#aT').value,status:'assigned'},'Assigned to '+tName($('#aT').value));
+const assign = id => !$('#aT').value ? toast('Select a transporter first.') : step(id,{transporter_id:$('#aT').value,status:'assigned'},'Assigned to '+tName($('#aT').value));
 const delay = id => { const r=$('#dr').value,d=$('#dd').value; if(!r||!d) return toast('Add a reason and a revised date.'); step(id,{delay_reason:r,revised_date:d},'Delay reported',`${r} · new date ${d}`); };
 async function upload(file, id, kind) { const path=`${kind}/${id}-${Date.now()}-${file.name.replace(/[^\w.]/g,'_')}`; const {error}=await sb.storage.from('docs').upload(path,file); if(error){toast('Upload failed: '+error.message);return null;} return path; }
 async function dispatch(id) { const lr=$('#lr').value, f=$('#lrf').files[0]; if(!lr) return toast('Enter the LR number.'); const p = f ? await upload(f,id,'lr') : null; step(id,{lr_no:lr,lr_url:p,status:'dispatched'},'LR updated and dispatched',lr); }
@@ -126,7 +128,7 @@ function toInvoice(r) {
 async function saveInvoices(rows) {
   const out = rows.map(toInvoice).filter(Boolean), skipped = rows.length-out.length;
   for (let n=0; n<out.length; n+=200) { const {error}=await sb.from('invoices').upsert(out.slice(n,n+200),{onConflict:'invoice_no',ignoreDuplicates:true}); if (error) return toast(error.message); }
-  toast(`Imported ${out.length} invoices${skipped?` · skipped ${skipped} (dealer not found or fields missing)`:''}`); refresh();
+  toast(`Imported ${out.length} invoices${skipped?` · skipped ${skipped} (dealer not found or fields missing)`:''}`); await refresh(); return out;
 }
 async function importInvoices(e) { const rows = await readCSV(e); if (rows) saveInvoices(rows); }
 async function importPdf(e) {
@@ -140,7 +142,8 @@ async function importPdf(e) {
   const key = s => s.toUpperCase().replace(/\s+/g,''), T = key(txt);
   const d = [...dealers].sort((a,b)=>b.name.length-a.name.length).find(x => T.includes(key(x.name)));
   if (!no || !dt || !d) return toast('Could not read this PDF. Check that the invoice number, date and dealer name are in the dealer list.');
-  await saveInvoices([{invoice_no:no, invoice_date:new Date(dt+' 12:00').toISOString().slice(0,10), dealer_name:d.name, units, amount:(amt||'').replace(/,/g,'')}]);
+  const done = await saveInvoices([{invoice_no:no, invoice_date:new Date(dt+' 12:00').toISOString().slice(0,10), dealer_name:d.name, units, amount:(amt||'').replace(/,/g,'')}]);
+  const inv = invoices.find(x => x.invoice_no===no); if (done && inv) { go('inv'); openInvoice(inv.id); }
 }
 function mas() {
   $('#title').textContent = 'Masters';
