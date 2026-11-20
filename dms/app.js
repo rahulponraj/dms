@@ -1,7 +1,7 @@
 let sb = supabase.createClient(DMS_CONFIG.SUPABASE_URL, DMS_CONFIG.SUPABASE_ANON_KEY);
 const $ = s => document.querySelector(s), today = () => new Date().toISOString().slice(0,10);
 const STEPS = [['imported','Imported'],['assigned','Assigned'],['accepted','Accepted'],['dispatched','Dispatched'],['in_transit','In transit'],['delivered','Delivered'],['closed','Closed']];
-let me, invoices = [], dealers = [], transporters = [], tab, filter = {q:'',s:''};
+let me, invoices = [], dealers = [], transporters = [], tab, filter = {q:'',s:'',t:'',d:''};
 const toast = m => { const t=$('#toast'); t.textContent=m; t.classList.add('on'); setTimeout(()=>t.classList.remove('on'),2600); };
 const fmt = d => d ? new Date(d+'T00:00').toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : '—';
 const due = i => i.revised_date || i.expected_date;
@@ -24,10 +24,11 @@ async function boot() {
   if (!p) { $('#loginErr').textContent = pe ? 'Could not load your profile: ' + pe.message : 'Your account has no role yet. Ask HQ to set it up.'; return; }
   me = p; $('#login').hidden = true; $('#app').hidden = false;
   $('#who').textContent = `${p.name || user.email} · ${p.role === 'admin' ? 'HQ' : 'Transporter'}${sb.isDemo ? ' · DEMO' : ''}`;
-  const nav = p.role === 'admin' ? [['dash','Dashboard'],['inv','Invoices'],['pod','POD review'],['mas','Masters']] : [['inv','My deliveries']];
-  $('#nav').innerHTML = nav.map(n=>`<button data-t="${n[0]}">${n[1]}</button>`).join('');
-  $('#nav').onclick = e => e.target.dataset.t && go(e.target.dataset.t);
-  await load(); go(nav[0][0]);
+  const nav = p.role === 'admin' ? [['dash','Dashboard',''],['inv','All invoices',''],['inv','POD review','pod'],['mas','Masters','']] : [['tdash','Dashboard',''],['inv','New requests','await'],['inv','All deliveries','']];
+  $('#nav').innerHTML = nav.map(n=>`<button data-t="${n[0]}" data-p="${n[2]}">${n[1]}</button>`).join('');
+  $('#nav').onclick = e => e.target.dataset.t && go(e.target.dataset.t, e.target.dataset.p);
+  $('#view').onclick = e => { const el = e.target.closest('[data-drill]'); if (el) drill(el.dataset.drill, {t:el.dataset.t, d:el.dataset.d}); };
+  await load(); go(nav[0][0], nav[0][2]);
 }
 async function load() {
   const [i,d,t] = await Promise.all([sb.from('invoices').select('*').order('invoice_date',{ascending:false}), sb.from('dealers').select('*').order('name'), sb.from('transporters').select('*').order('name')]);
@@ -39,37 +40,98 @@ function go(t) {
 }
 async function refresh() { await load(); go(tab); }
 
-/* ---------- Dashboard ---------- */
-function dash() {
-  $('#title').textContent = 'Delivery overview';
-  const c = f => invoices.filter(f).length;
-  const k = [['Pending assignment',c(i=>['imported','assigned'].includes(i.status)),'var(--blue)'],['In transit',c(i=>['accepted','dispatched','in_transit'].includes(i.status)&&!overdue(i)),'var(--teal)'],['Overdue',c(overdue),'var(--red)'],['POD to review',c(i=>i.pod_status==='pending'),'var(--amber)'],['Closed',c(i=>i.status==='closed'),'var(--green)']];
-  const perf = transporters.map(t => { const mine = invoices.filter(i=>i.transporter_id===t.id); const done = mine.filter(i=>['delivered','closed'].includes(i.status)); const late = mine.filter(overdue).length; return {n:t.name,total:mine.length,done:done.length,late}; }).filter(p=>p.total);
-  $('#view').innerHTML = `<div class="kpis">${k.map(x=>`<div class="kpi" style="--c:${x[2]}"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('')}</div>
-  <div class="panel"><h3>Transporter performance</h3><p class="muted">Delivered share of assigned invoices. Overdue count shown on the right.</p><div class="bars">${perf.map(p=>`<div class="bar"><span>${esc(p.n)}</span><div><i style="width:${p.total?Math.round(p.done/p.total*100):0}%"></i></div><span>${p.done}/${p.total}${p.late?` · <b style="color:var(--red)">${p.late} late</b>`:''}</span></div>`).join('')||'<p class="muted">Assign invoices to see performance.</p>'}</div></div>
-  <div class="panel"><h3>Needs attention</h3>${table(invoices.filter(i=>overdue(i)||i.pod_status==='pending').slice(0,8))}</div>`;
-  bindRows();
+/* ---------- Helpers, filters ---------- */
+const inr = n => '₹'+Number(n||0).toLocaleString('en-IN');
+const dayDiff = (a,b) => Math.round((new Date(b+'T00:00')-new Date(a+'T00:00'))/864e5);
+const late = i => overdue(i) ? dayDiff(due(i), today()) : 0;
+const open_ = i => !['delivered','closed'].includes(i.status);
+const dCity = id => dealers.find(d=>d.id===id)?.city || '';
+const F = {
+  '':{l:'All invoices',f:()=>true}, assign:{l:'Needs assignment',f:i=>i.status==='imported'}, await:{l:'Awaiting acceptance',f:i=>i.status==='assigned'},
+  progress:{l:'In progress',f:i=>['accepted','dispatched','in_transit'].includes(i.status)&&!overdue(i)}, overdue:{l:'Overdue',f:overdue},
+  late1:{l:'Overdue 1–2 days',f:i=>overdue(i)&&late(i)<=2}, late3:{l:'Overdue 3–5 days',f:i=>overdue(i)&&late(i)>=3&&late(i)<=5}, late6:{l:'Overdue 6+ days',f:i=>overdue(i)&&late(i)>=6},
+  delayed:{l:'Delay reported',f:i=>i.delay_reason&&open_(i)}, pod:{l:'POD to review',f:i=>i.pod_status==='pending'},
+  rejected:{l:'POD rejected',f:i=>i.pod_status==='rejected'&&i.status!=='closed'}, closed:{l:'Closed',f:i=>i.status==='closed'}
+};
+function stat(l) {
+  const dn = l.filter(i=>['delivered','closed'].includes(i.status)&&i.delivery_date), ot = dn.filter(i=>i.delivery_date<=due(i)).length;
+  const days = dn.map(i=>dayDiff(i.invoice_date,i.delivery_date)).filter(x=>x>=0);
+  return {total:l.length, done:l.filter(i=>!open_(i)).length, ontime:dn.length?Math.round(ot/dn.length*100):null, avg:days.length?(days.reduce((a,b)=>a+b,0)/days.length).toFixed(1):null,
+    overdue:l.filter(overdue).length, progress:l.filter(F.progress.f).length, value:l.filter(open_).reduce((s,i)=>s+(+i.amount||0),0), delivered:l.filter(i=>!open_(i)).reduce((s,i)=>s+(+i.amount||0),0)};
 }
-
-/* ---------- Invoices ---------- */
+const kpi = (label,n,color,key) => `<button class="kpi" data-drill="${key}" style="--c:${color}"><b>${n}</b><span>${label}</span><small>View list →</small></button>`;
+const ins = (label,val,sub) => `<div class="ins"><span>${label}</span><b>${val}</b><small>${sub||''}</small></div>`;
+const pc = v => v==null ? '—' : v+'%';
+function drill(s,o={}) { filter = {q:'',s:s||'',t:o.t||'',d:o.d||''}; go('inv'); }
+function go(t,p) {
+  if (p!==undefined) filter = {q:'',s:p,t:'',d:''};
+  tab = t; const bs = [...document.querySelectorAll('#nav button')];
+  const m = bs.find(b=>b.dataset.t===t&&(t!=='inv'||b.dataset.p===filter.s)) || bs.find(b=>b.dataset.t===t); bs.forEach(b=>b.classList.toggle('on',b===m));
+  $('#actions').innerHTML = ''; ({dash,tdash,inv,mas})[t]();
+}
+async function refresh() { await load(); go(tab); }
+function bindRows() { document.querySelectorAll('tr.row').forEach(r=>r.onclick=()=>openInvoice(r.dataset.id)); }
 function table(list) {
   if (!list.length) return '<p class="muted">Nothing here yet.</p>';
-  return `<table><tr><th>Invoice</th><th>Dealer</th><th>Transporter</th><th>Due</th><th>Status</th></tr>${list.map(i=>`<tr class="row" data-id="${i.id}"><td><b>${esc(i.invoice_no)}</b></td><td>${esc(dName(i.dealer_id))}</td><td>${esc(tName(i.transporter_id))}</td><td>${fmt(due(i))}</td><td>${pill(i)}</td></tr>`).join('')}</table>`;
+  return `<table><tr><th>Invoice</th><th>Dealer</th><th>Transporter</th><th>Due</th><th>Status</th></tr>${list.map(i=>`<tr class="row" data-id="${i.id}"><td><b>${esc(i.invoice_no)}</b></td><td>${esc(dName(i.dealer_id))}</td><td>${esc(tName(i.transporter_id))}</td><td>${fmt(due(i))}${late(i)?`<br><small style="color:var(--red)">${late(i)}d late</small>`:''}</td><td>${pill(i)}</td></tr>`).join('')}</table>`;
 }
-function bindRows() { document.querySelectorAll('tr.row').forEach(r=>r.onclick=()=>openInvoice(r.dataset.id)); }
+async function feed() {
+  const t0 = tab, {data} = await sb.from('activity_log').select('*').order('created_at',{ascending:false}).limit(10);
+  if (tab!==t0 || !$('#feed')) return;
+  $('#feed').innerHTML = `<h3>Recent activity</h3>${(data||[]).length?`<table>${data.map(l=>{const i=invoices.find(x=>x.id===l.invoice_id);return `<tr class="row" data-id="${l.invoice_id}"><td><b>${esc(i?.invoice_no||'')}</b></td><td>${esc(l.action)}</td><td>${esc(l.actor)}</td><td class="muted">${new Date(l.created_at).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</td></tr>`}).join('')}</table>`:'<p class="muted">No activity yet.</p>'}`; bindRows();
+}
+
+/* ---------- HQ dashboard ---------- */
+function dash() {
+  $('#title').textContent = 'Delivery overview';
+  const c = k => invoices.filter(F[k].f).length, S = stat(invoices), mo = today().slice(0,7), thisMonth = invoices.filter(i=>i.delivery_date&&i.delivery_date.startsWith(mo)).length;
+  const perf = transporters.map(t=>{const l=invoices.filter(i=>i.transporter_id===t.id);return {t,l,s:stat(l)}}).filter(p=>p.l.length).sort((a,b)=>b.l.length-a.l.length);
+  const chip = (k,l) => `<button class="chip" data-drill="${k}"><b>${c(k)}</b> ${l}</button>`;
+  $('#view').innerHTML = `<div class="kpis">${kpi('Needs assignment',c('assign'),'var(--blue)','assign')}${kpi('Awaiting acceptance',c('await'),'#7a5cd6','await')}${kpi('In progress',c('progress'),'var(--teal)','progress')}${kpi('Overdue',c('overdue'),'var(--red)','overdue')}${kpi('POD to review',c('pod'),'var(--amber)','pod')}${kpi('Closed',c('closed'),'var(--green)','closed')}</div>
+  <div class="kpis">${ins('On-time delivery',pc(S.ontime),'of delivered invoices')}${ins('Avg delivery time',S.avg==null?'—':S.avg+' days','invoice to delivery')}${ins('Value in transit',inr(S.value),'open invoices')}${ins('Delivered this month',thisMonth,'invoices')}</div>
+  <div class="split"><div class="panel"><h3>Transporter performance</h3><p class="muted">Select a transporter to see all their invoices.</p><table><tr><th>Transporter</th><th>Assigned</th><th>Active</th><th>Overdue</th><th>Delivered</th><th>On-time</th></tr>${perf.map(p=>`<tr class="crow" data-drill="" data-t="${p.t.id}"><td><b>${esc(p.t.name)}</b></td><td>${p.s.total}</td><td>${p.l.filter(open_).length}</td><td style="color:${p.s.overdue?'var(--red)':'inherit'}">${p.s.overdue}</td><td>${p.s.done}</td><td>${pc(p.s.ontime)}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">Assign invoices to see performance.</td></tr>'}</table></div>
+  <div class="panel"><h3>Overdue ageing</h3><p class="muted">How late open invoices are.</p><div class="chips">${chip('late1','1–2 days')}${chip('late3','3–5 days')}${chip('late6','6+ days')}</div><h3 style="margin-top:22px">Other flags</h3><div class="chips">${chip('delayed','delay reported')}${chip('rejected','POD rejected')}</div></div></div>
+  <div class="panel"><h3>Needs attention</h3>${table(invoices.filter(i=>overdue(i)||i.pod_status==='pending').sort((a,b)=>late(b)-late(a)).slice(0,10))}<p><button class="link" data-drill="overdue">View all overdue →</button></p></div>
+  <div class="panel" id="feed"><h3>Recent activity</h3><p class="muted">Loading…</p></div>`;
+  bindRows(); feed();
+}
+
+/* ---------- Transporter dashboard ---------- */
+function tdash() {
+  $('#title').textContent = `Welcome, ${me.name||'transporter'}`;
+  const c = k => invoices.filter(F[k].f).length, S = stat(invoices);
+  const next = i => i.pod_status==='rejected'&&i.status!=='closed' ? 'Re-upload POD' : ({assigned:'Accept invoice',accepted:'Add LR and dispatch',dispatched:'Mark in transit',in_transit:'Update status or deliver'})[i.status];
+  const act = invoices.filter(open_).sort((a,b)=>(due(a)||'')>(due(b)||'')?1:-1);
+  const ms = [...Array(6)].map((_,k)=>{const d=new Date();d.setMonth(d.getMonth()-5+k,1);return d.toISOString().slice(0,7)});
+  const mc = ms.map(m=>invoices.filter(i=>!open_(i)&&(i.delivery_date||'').startsWith(m)).length), mx = Math.max(1,...mc);
+  const byD = {}; invoices.forEach(i=>(byD[i.dealer_id]=byD[i.dealer_id]||[]).push(i));
+  $('#view').innerHTML = `<div class="kpis">${kpi('New requests',c('await'),'#7a5cd6','await')}${kpi('In progress',c('progress'),'var(--teal)','progress')}${kpi('Overdue',c('overdue'),'var(--red)','overdue')}${kpi('POD with HQ',c('pod'),'var(--amber)','pod')}${kpi('POD rejected',c('rejected'),'var(--red)','rejected')}${kpi('Completed',c('closed'),'var(--green)','closed')}</div>
+  <div class="kpis">${ins('On-time delivery',pc(S.ontime),'of your deliveries')}${ins('Avg delivery time',S.avg==null?'—':S.avg+' days','invoice to delivery')}${ins('Total handled',S.total,'invoices')}${ins('Value delivered',inr(S.delivered),'completed')}</div>
+  <div class="panel"><h3>Needs your action</h3>${act.length?`<table><tr><th>Invoice</th><th>Dealer</th><th>Due</th><th>Next step</th><th>Status</th></tr>${act.slice(0,10).map(i=>`<tr class="row" data-id="${i.id}"><td><b>${esc(i.invoice_no)}</b></td><td>${esc(dName(i.dealer_id))}</td><td>${fmt(due(i))}${late(i)?`<br><small style="color:var(--red)">${late(i)}d late</small>`:''}</td><td><b>${next(i)||''}</b></td><td>${pill(i)}</td></tr>`).join('')}</table>`:'<p class="muted">You are all caught up.</p>'}</div>
+  <div class="split"><div class="panel"><h3>Deliveries per month</h3><div class="bars">${ms.map((m,k)=>`<div class="bar"><span>${new Date(m+'-01').toLocaleString('en-IN',{month:'short',year:'2-digit'})}</span><div><i style="width:${mc[k]/mx*100}%"></i></div><span>${mc[k]}</span></div>`).join('')}</div></div>
+  <div class="panel"><h3>By dealer</h3><table><tr><th>Dealer</th><th>Shipments</th><th>Delivered</th><th>On-time</th></tr>${Object.entries(byD).map(([id,l])=>[id,l,stat(l)]).sort((a,b)=>b[1].length-a[1].length).slice(0,8).map(([id,l,s])=>`<tr class="crow" data-drill="" data-d="${id}"><td>${esc(dName(id))}</td><td>${l.length}</td><td>${s.done}</td><td>${pc(s.ontime)}</td></tr>`).join('')}</table></div></div>
+  <div class="panel" id="feed"><h3>Recent activity</h3><p class="muted">Loading…</p></div>`;
+  bindRows(); feed();
+}
+
+/* ---------- Invoice list (drill-down) ---------- */
 function inv() {
-  const admin = me.role==='admin'; $('#title').textContent = admin ? 'Invoices' : 'My deliveries';
-  if (admin) $('#actions').innerHTML = `<label class="btn primary">Upload invoice PDF<input type="file" accept=".pdf" hidden id="impPdf"></label><label class="btn">Import CSV<input type="file" accept=".csv" hidden id="impInv"></label>`;
-  $('#view').innerHTML = `<div class="panel"><div class="tools"><input id="q" placeholder="Search invoice or dealer" value="${esc(filter.q)}"><select id="fs"><option value="">All statuses</option>${STEPS.map(s=>`<option value="${s[0]}">${s[1]}</option>`).join('')}<option value="overdue">Overdue</option></select></div><div id="tbl"></div></div>`;
-  $('#fs').value = filter.s;
-  const draw = () => { filter.q=$('#q').value; filter.s=$('#fs').value; const q=filter.q.toLowerCase();
-    $('#tbl').innerHTML = table(invoices.filter(i=>(!q||i.invoice_no.toLowerCase().includes(q)||dName(i.dealer_id).toLowerCase().includes(q))&&(!filter.s||(filter.s==='overdue'?overdue(i):i.status===filter.s)))); bindRows(); };
-  $('#q').oninput = draw; $('#fs').onchange = draw; draw();
+  const admin = me.role==='admin', P = F[filter.s]||F[''];
+  $('#title').textContent = filter.s==='' ? (admin?'All invoices':'My deliveries') : (filter.s==='await'&&!admin ? 'New requests' : P.l);
+  $('#actions').innerHTML = `${admin?`<label class="btn primary">Upload invoice PDF<input type="file" accept=".pdf" hidden id="impPdf"></label><label class="btn">Import CSV<input type="file" accept=".csv" hidden id="impInv"></label>`:''}<button class="btn" id="exp">Export CSV</button>`;
+  const full = l => !l.length ? '<p class="muted">Nothing here yet.</p>' : `<table><tr><th>Invoice</th><th>Dealer</th><th>Units</th><th>Amount</th>${admin?'<th>Transporter</th>':''}<th>LR</th><th>Due</th><th>Status</th></tr>${l.map(i=>`<tr class="row" data-id="${i.id}"><td><b>${esc(i.invoice_no)}</b><br><small class="muted">${fmt(i.invoice_date)}</small></td><td>${esc(dName(i.dealer_id))}<br><small class="muted">${esc(dCity(i.dealer_id))}</small></td><td>${i.units??'—'}</td><td>${inr(i.amount)}</td>${admin?`<td>${esc(tName(i.transporter_id))}</td>`:''}<td>${esc(i.lr_no||'—')}</td><td>${fmt(due(i))}${late(i)?`<br><small style="color:var(--red)">${late(i)}d late</small>`:''}</td><td>${pill(i)}</td></tr>`).join('')}</table>`;
+  $('#view').innerHTML = `<div class="panel"><div class="tools"><button class="link" id="back">← Dashboard</button><input id="q" placeholder="Search invoice or dealer" value="${esc(filter.q)}"><select id="fs">${Object.entries(F).map(([k,v])=>`<option value="${k}">${k===''?'All statuses':v.l}</option>`).join('')}</select>${filter.t?`<span class="chip">Transporter: ${esc(tName(filter.t))} <button class="link" data-clear="t">✕</button></span>`:''}${filter.d?`<span class="chip">Dealer: ${esc(dName(filter.d))} <button class="link" data-clear="d">✕</button></span>`:''}</div><p class="muted" id="sum"></p><div id="tbl"></div></div>`;
+  $('#fs').value = filter.s; let cur = [];
+  const draw = () => { filter.q=$('#q').value; filter.s=$('#fs').value; const q=filter.q.toLowerCase(), f=(F[filter.s]||F['']).f;
+    cur = invoices.filter(i=>f(i)&&(!filter.t||i.transporter_id===filter.t)&&(!filter.d||i.dealer_id===filter.d)&&(!q||i.invoice_no.toLowerCase().includes(q)||dName(i.dealer_id).toLowerCase().includes(q)));
+    $('#sum').textContent = `${cur.length} invoices · ${inr(cur.reduce((s,i)=>s+(+i.amount||0),0))}`; $('#tbl').innerHTML = full(cur); bindRows(); };
+  $('#q').oninput = draw; $('#fs').onchange = () => { $('#title').textContent = $('#fs').value===''?(admin?'All invoices':'My deliveries'):F[$('#fs').value].l; draw(); }; draw();
+  $('#back').onclick = () => go(admin?'dash':'tdash');
+  document.querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{filter[b.dataset.clear]='';inv();});
+  $('#exp').onclick = () => { const q=v=>'"'+String(v??'').replace(/"/g,'""')+'"', h=['invoice_no','invoice_date','dealer','units','amount','transporter','lr_no','expected_date','revised_date','delivery_date','status'];
+    const csv=[h.join(','),...cur.map(i=>[i.invoice_no,i.invoice_date,dName(i.dealer_id),i.units,i.amount,tName(i.transporter_id),i.lr_no,i.expected_date,i.revised_date,i.delivery_date,i.status].map(q).join(','))].join('\n');
+    const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'})); a.download='dms-invoices.csv'; a.click(); };
   if (admin) { $('#impInv').onchange = importInvoices; $('#impPdf').onchange = importPdf; }
-}
-function pod() {
-  $('#title').textContent = 'POD review';
-  $('#view').innerHTML = `<div class="panel">${table(invoices.filter(i=>i.pod_status==='pending'))}</div>`; bindRows();
 }
 
 /* ---------- Invoice drawer ---------- */
